@@ -32,10 +32,10 @@ jobs:
 
       - name: Créer l'exécutable
         run: |
-          pyinstaller --onefile --windowed --name ComparateurDefauts --add-binary "hexalign.exe;." main.py
+          pyinstaller --onefile --windowed --name QIAnalyse --add-binary "hexalign.exe;." main.py
 
       - name: Publier l'exe
         uses: actions/upload-artifact@v4
         with:
-          name: ComparateurDefauts-Windows
-          path: dist/ComparateurDefauts.exe
+          name: QIAnalyse-Windows
+          path: dist/QIAnalyse.exe
