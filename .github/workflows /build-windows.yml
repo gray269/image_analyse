@@ -30,6 +30,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+
       - name: Créer l'exécutable
         run: |
           pyinstaller --onefile --windowed --name QIAnalyse --add-binary "hexalign.exe;." main.py
