@@ -11,7 +11,6 @@ import queue
 import re
 import threading
 import time
-
 import sys
 import subprocess
 import tempfile
@@ -619,7 +618,7 @@ def path_under_root(path_str: str, root: Path) -> bool:
     return path_s.startswith(root_s)
 
 
-def cache_records_for_roots(files_cache: dict, text_dir: Path, image_dir: Path, product_filter: str = "") -> tuple[list[TextRun], list[ImageRun]]:
+def cache_records_for_roots(files_cache: dict, text_dir: Path, image_dir: Path | None, product_filter: str = "") -> tuple[list[TextRun], list[ImageRun]]:
     product_filter = product_filter.strip()
     text_runs: list[TextRun] = []
     image_runs: list[ImageRun] = []
@@ -631,11 +630,10 @@ def cache_records_for_roots(files_cache: dict, text_dir: Path, image_dir: Path, 
 
         if entry.get("kind") == "txt" and path_under_root(path_str, text_dir):
             text_runs.append(text_run_from_cache(path_str, entry))
-        elif entry.get("kind") == "image" and path_under_root(path_str, image_dir):
+        elif image_dir is not None and entry.get("kind") == "image" and path_under_root(path_str, image_dir):
             image_runs.append(image_run_from_cache(path_str, entry))
 
     return text_runs, image_runs
-
 
 def iter_files_fast(root: Path, suffixes: set[str], cancel_event: threading.Event,
                     product_filter: str = "", kind: str = "", progress_callback=None):
@@ -858,113 +856,160 @@ def unique_paths(paths):
     return out
 
 
-def follow_txt_candidate_paths(text_dir: Path, target: str, progress_callback=None) -> list[Path]:
-    """Recherche ciblée des TXT d'un module en évitant le scan global serveur.
 
-    Cas optimisés :
-    - text_dir/NUMERO.txt
-    - text_dir/NUMERO_*.txt
-    - text_dir/NUMERO*/...
-    - text_dir/*/NUMERO*.txt et text_dir/*/*/NUMERO*.txt
+def fast_directory_glob(directory: Path, pattern: str, want_dirs: bool | None = None) -> list[Path]:
+    """Glob non récursif optimisé pour éviter le scan profond serveur."""
+    directory = Path(directory)
+    if not directory.exists():
+        return []
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            FILE_ATTRIBUTE_DIRECTORY = 0x10
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            class WIN32_FIND_DATAW(ctypes.Structure):
+                _fields_ = [
+                    ("dwFileAttributes", wintypes.DWORD),
+                    ("ftCreationTime", wintypes.FILETIME),
+                    ("ftLastAccessTime", wintypes.FILETIME),
+                    ("ftLastWriteTime", wintypes.FILETIME),
+                    ("nFileSizeHigh", wintypes.DWORD),
+                    ("nFileSizeLow", wintypes.DWORD),
+                    ("dwReserved0", wintypes.DWORD),
+                    ("dwReserved1", wintypes.DWORD),
+                    ("cFileName", wintypes.WCHAR * 260),
+                    ("cAlternateFileName", wintypes.WCHAR * 14),
+                    ("dwFileType", wintypes.DWORD),
+                    ("dwCreatorType", wintypes.DWORD),
+                    ("wFinderFlags", wintypes.WORD),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            find_first = kernel32.FindFirstFileW
+            find_first.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(WIN32_FIND_DATAW)]
+            find_first.restype = wintypes.HANDLE
+            find_next = kernel32.FindNextFileW
+            find_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(WIN32_FIND_DATAW)]
+            find_next.restype = wintypes.BOOL
+            find_close = kernel32.FindClose
+            find_close.argtypes = [wintypes.HANDLE]
+            find_close.restype = wintypes.BOOL
+
+            data = WIN32_FIND_DATAW()
+            handle = find_first(str(directory / pattern), ctypes.byref(data))
+            if handle == INVALID_HANDLE_VALUE:
+                return []
+
+            out = []
+            try:
+                while True:
+                    name = data.cFileName
+                    if name not in (".", ".."):
+                        is_dir = bool(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                        if want_dirs is None or is_dir == want_dirs:
+                            out.append(directory / name)
+                    if not find_next(handle, ctypes.byref(data)):
+                        break
+            finally:
+                find_close(handle)
+            return out
+        except Exception:
+            pass
+
+    try:
+        out = []
+        for p in directory.glob(pattern):
+            try:
+                if want_dirs is None or p.is_dir() == want_dirs:
+                    out.append(p)
+            except OSError:
+                continue
+        return out
+    except OSError:
+        return []
+
+
+def follow_txt_candidate_paths(text_dir: Path, target: str, progress_callback=None) -> list[Path]:
+    """Mode suivi ultra-rapide : pas de scan récursif serveur.
+
+    On lit uniquement dans le dossier TXT sélectionné :
+    - NUMERO.txt
+    - NUMERO*.txt pour les fichiers avec date/suffixe
     """
     target = str(target).strip()
     if not target:
         return []
 
+    text_dir = Path(text_dir)
     candidates = []
 
-    # 1) Cas le plus rapide : fichier exact ou fichiers préfixés à la racine.
     direct = text_dir / f"{target}.txt"
-    if direct.exists():
-        candidates.append(direct)
+    try:
+        if direct.is_file():
+            candidates.append(direct)
+    except OSError:
+        pass
 
-    patterns = [
-        f"{target}_*.txt",
-        f"{target}*.txt",
-        f"{target}/*.txt",
-        f"{target}*/*.txt",
-        f"*/{target}.txt",
-        f"*/{target}_*.txt",
-        f"*/{target}*.txt",
-        f"*/*/{target}.txt",
-        f"*/*/{target}_*.txt",
-        f"*/*/{target}*.txt",
-    ]
+    candidates.extend(fast_directory_glob(text_dir, f"{target}*.txt", want_dirs=False))
+    candidates = [p for p in unique_paths(candidates) if p.suffix.lower() == ".txt" and p.name.startswith(target)]
 
-    for pattern in patterns:
-        try:
-            for p in text_dir.glob(pattern):
-                if p.is_file() and p.suffix.lower() == ".txt":
-                    # Sécurité : on garde seulement les fichiers dont le nom contient bien le module.
-                    if target in p.name or target in p.stem:
-                        candidates.append(p)
-        except OSError:
-            continue
-
-    candidates = unique_paths(candidates)
     if progress_callback:
-        progress_callback(f"Mode suivi TXT {target} : {len(candidates)} candidat(s) ciblé(s).", len(candidates))
+        progress_callback(
+            f"Mode suivi TXT {target} : {len(candidates)} fichier(s) trouvé(s) directement dans le dossier TXT.",
+            len(candidates),
+        )
     return candidates
 
 
 def follow_image_candidate_roots(image_dir: Path, product: str, progress_callback=None) -> list[Path]:
-    """Trouve les dossiers images d'un module sans parcourir tout le serveur.
-
-    Le cas recherché est un dossier contenant les images et nommé avec le numéro de module.
-    """
+    """Recherche ciblée des dossiers images du module, sans scan profond."""
     product = str(product).strip()
     if not product:
         return []
 
+    image_dir = Path(image_dir)
     roots = []
-    patterns = [
-        product,
-        f"{product}*",
-        f"*/{product}",
-        f"*/{product}*",
-        f"*/*/{product}",
-        f"*/*/{product}*",
-        f"*/QIA/{product}",
-        f"*/QIA/{product}*",
-        f"*/*/QIA/{product}",
-        f"*/*/QIA/{product}*",
-    ]
 
-    for pattern in patterns:
-        try:
-            for p in image_dir.glob(pattern):
-                if p.is_dir():
-                    roots.append(p)
-        except OSError:
-            continue
+    # Cas directs : dossier images\NUMERO* et dossier images\QIA\NUMERO*
+    roots.extend(fast_directory_glob(image_dir, f"{product}*", want_dirs=True))
+    roots.extend(fast_directory_glob(image_dir / "QIA", f"{product}*", want_dirs=True))
+
+    # Cas NomDuBanc\QIA\NUMERO* : scan seulement des dossiers niveau 1.
+    try:
+        with os.scandir(image_dir) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    qia = Path(entry.path) / "QIA"
+                    if qia.exists():
+                        roots.extend(fast_directory_glob(qia, f"{product}*", want_dirs=True))
+                except OSError:
+                    continue
+    except OSError:
+        pass
 
     roots = unique_paths(roots)
     if progress_callback:
-        progress_callback(f"Mode suivi images {product} : {len(roots)} dossier(s) candidat(s).", len(roots))
+        progress_callback(f"Mode suivi images {product} : {len(roots)} dossier(s) direct(s) trouvé(s).", len(roots))
     return roots
 
 
 def follow_image_candidate_files(image_dir: Path, product: str) -> list[Path]:
-    """Fallback ciblé si les images ne sont pas dans un dossier module."""
+    """Fallback non récursif : images directement dans le dossier image."""
     product = str(product).strip()
+    if not product:
+        return []
+
+    image_dir = Path(image_dir)
     candidates = []
-
-    patterns = [
-        f"{product}*",
-        f"*/{product}*",
-        f"*/*/{product}*",
-    ]
-
-    for pattern in patterns:
-        try:
-            for p in image_dir.glob(pattern):
-                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
-                    candidates.append(p)
-        except OSError:
-            continue
-
+    for ext in IMAGE_EXTENSIONS:
+        candidates.extend(fast_directory_glob(image_dir, f"{product}*{ext}", want_dirs=False))
     return unique_paths(candidates)
-
 
 def iter_images_under_roots_for_follow(roots: list[Path], cancel_event: threading.Event,
                                        progress_callback=None):
@@ -996,13 +1041,14 @@ def iter_images_under_roots_for_follow(roots: list[Path], cancel_event: threadin
             continue
 
 
-def scan_follow_targets_indexed(text_dir: Path, image_dir: Path, follow_targets: list[str],
+def scan_follow_targets_indexed(text_dir: Path, image_dir: Path | None, follow_targets: list[str],
                                 cache_only: bool = False,
                                 cancel_event: threading.Event | None = None,
                                 progress_callback=None,
                                 max_files_per_type: int | None = None,
                                 start_dt: datetime | None = None,
-                                end_dt: datetime | None = None) -> tuple[list[TextRun], list[ImageRun], dict]:
+                                end_dt: datetime | None = None,
+                                txt_only: bool = False) -> tuple[list[TextRun], list[ImageRun], dict]:
     """Scan optimisé pour le mode suivi.
 
     Contrairement au scan standard, il ne parcourt pas les 200 000 fichiers.
@@ -1124,7 +1170,7 @@ def scan_follow_targets_indexed(text_dir: Path, image_dir: Path, follow_targets:
     allowed_products = {r.product for r in text_runs}
 
     image_runs: list[ImageRun] = []
-    if allowed_products:
+    if allowed_products and not txt_only and image_dir is not None:
         for product_idx, product in enumerate(sorted(allowed_products), start=1):
             if cancel_event.is_set():
                 break
@@ -1198,11 +1244,12 @@ def scan_follow_targets_indexed(text_dir: Path, image_dir: Path, follow_targets:
     }
 
 
-def scan_folders_indexed(text_dir: Path, image_dir: Path, product_filter: str = "",
+def scan_folders_indexed(text_dir: Path, image_dir: Path | None, product_filter: str = "",
                          cache_only: bool = False, cancel_event: threading.Event | None = None,
                          progress_callback=None, max_files_per_type: int | None = None,
                          start_dt: datetime | None = None,
-                         end_dt: datetime | None = None) -> tuple[list[TextRun], list[ImageRun], dict]:
+                         end_dt: datetime | None = None,
+                         txt_only: bool = False) -> tuple[list[TextRun], list[ImageRun], dict]:
     """Scan en deux étapes.
 
     1) Le dossier TXT est la source de vérité.
@@ -1239,8 +1286,11 @@ def scan_folders_indexed(text_dir: Path, image_dir: Path, product_filter: str = 
         if max_files_per_type > 0:
             text_runs = text_runs[:max_files_per_type]
         allowed_products = {r.product for r in text_runs}
-        image_runs = [img for img in image_runs if img.product in allowed_products]
-        image_runs = [img for img in image_runs if date_in_interval(file_creation_datetime(img.path), start_dt, end_dt)]
+        if txt_only or image_dir is None:
+            image_runs = []
+        else:
+            image_runs = [img for img in image_runs if img.product in allowed_products]
+            image_runs = [img for img in image_runs if date_in_interval(file_creation_datetime(img.path), start_dt, end_dt)]
         return text_runs, image_runs, {
             "from_cache_only": True,
             "parsed_txt": 0,
@@ -1306,6 +1356,22 @@ def scan_folders_indexed(text_dir: Path, image_dir: Path, product_filter: str = 
         save_index_cache(files_cache)
         return text_runs, [], {
             "from_cache_only": False,
+            "parsed_txt": parsed_txt,
+            "parsed_images": 0,
+            "cache_hits": cache_hits,
+            "visited_txt": visited_txt,
+            "visited_images": 0,
+            "max_files_per_type": max_files_per_type,
+            "skipped_txt_outside_date": skipped_txt_outside_date,
+            "skipped_images_not_in_txt_modules": 0,
+            "selected_txt": len(text_runs),
+        }
+
+    if txt_only or image_dir is None:
+        save_index_cache(files_cache)
+        return text_runs, [], {
+            "from_cache_only": False,
+            "txt_only": True,
             "parsed_txt": parsed_txt,
             "parsed_images": 0,
             "cache_hits": cache_hits,
@@ -2415,6 +2481,7 @@ class DefectCompareApp(tk.Tk):
         self.product_filter_var = tk.StringVar()
         self.cache_only_var = tk.BooleanVar(value=False)
         self.follow_mode_var = tk.BooleanVar(value=False)
+        self.txt_only_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Prêt.")
         self.follow_targets_text: ScrolledText | None = None
         self._scan_cancel_event: threading.Event | None = None
@@ -2469,6 +2536,7 @@ class DefectCompareApp(tk.Tk):
 
         ttk.Button(top, text="Scanner / Analyser", command=self.scan).grid(row=1, column=3, padx=4)
         ttk.Checkbutton(top, text="Mode suivi", variable=self.follow_mode_var).grid(row=1, column=4, padx=4, sticky="w")
+        ttk.Checkbutton(top, text="TXT uniquement", variable=self.txt_only_var).grid(row=2, column=4, padx=4, sticky="w")
         ttk.Button(top, text="Charger module précis", command=self.scan_filtered_product).grid(row=2, column=3, padx=4)
 
         ttk.Label(top, textvariable=self.status_var).grid(row=3, column=0, columnspan=4, padx=4, pady=(2, 0), sticky="w")
@@ -2604,14 +2672,19 @@ class DefectCompareApp(tk.Tk):
 
     def start_scan(self, product_filter: str = ""):
         text_dir = Path(self.text_dir_var.get()) if self.text_dir_var.get() else None
+        txt_only = bool(self.txt_only_var.get())
         image_dir = Path(self.image_dir_var.get()) if self.image_dir_var.get() else None
 
         if not text_dir or not text_dir.exists():
             messagebox.showerror("Erreur", "Choisis un dossier TXT valide.")
             return
-        if not image_dir or not image_dir.exists():
-            messagebox.showerror("Erreur", "Choisis un dossier images valide.")
+
+        # Nouveau : en mode TXT uniquement, le dossier image n'est plus obligatoire.
+        if not txt_only and (not image_dir or not image_dir.exists()):
+            messagebox.showerror("Erreur", "Choisis un dossier images valide ou coche TXT uniquement.")
             return
+        if txt_only:
+            image_dir = None
 
         if self._scan_cancel_event is not None:
             messagebox.showinfo("Scan en cours", "Un scan est déjà en cours.")
@@ -2622,11 +2695,12 @@ class DefectCompareApp(tk.Tk):
 
         self._scan_window = tk.Toplevel(self)
         self._scan_window.title("Scan en cours")
-        self._scan_window.geometry("520x130")
+        self._scan_window.geometry("560x130")
         self._scan_window.transient(self)
         self._scan_window.grab_set()
 
-        ttk.Label(self._scan_window, text="Scan / indexation des dossiers serveur…").pack(anchor="w", padx=12, pady=(12, 4))
+        mode_label = "Scan TXT uniquement…" if txt_only else "Scan / indexation des dossiers serveur…"
+        ttk.Label(self._scan_window, text=mode_label).pack(anchor="w", padx=12, pady=(12, 4))
         progress_label = ttk.Label(self._scan_window, textvariable=self.status_var)
         progress_label.pack(anchor="w", padx=12, pady=4)
         bar = ttk.Progressbar(self._scan_window, mode="indeterminate")
@@ -2648,7 +2722,10 @@ class DefectCompareApp(tk.Tk):
         def worker():
             try:
                 if follow_targets:
-                    progress(f"Mode suivi optimisé : recherche ciblée de {len(follow_targets)} module(s)…", 0)
+                    if txt_only:
+                        progress(f"Mode suivi TXT uniquement : lecture directe de {len(follow_targets)} module(s)…", 0)
+                    else:
+                        progress(f"Mode suivi ultra-rapide : lecture directe de {len(follow_targets)} module(s) dans le dossier TXT…", 0)
                     text_runs, image_runs, stats = scan_follow_targets_indexed(
                         text_dir=text_dir,
                         image_dir=image_dir,
@@ -2659,6 +2736,7 @@ class DefectCompareApp(tk.Tk):
                         max_files_per_type=get_max_files_per_type(),
                         start_dt=self.selected_date_range()[0],
                         end_dt=self.selected_date_range()[1],
+                        txt_only=txt_only,
                     )
                 else:
                     text_runs, image_runs, stats = scan_folders_indexed(
@@ -2671,11 +2749,13 @@ class DefectCompareApp(tk.Tk):
                         max_files_per_type=get_max_files_per_type(),
                         start_dt=self.selected_date_range()[0],
                         end_dt=self.selected_date_range()[1],
+                        txt_only=txt_only,
                     )
 
                 if self._scan_cancel_event and self._scan_cancel_event.is_set():
                     self._scan_queue.put(("cancelled", None))
                 else:
+                    stats["txt_only"] = txt_only
                     self._scan_queue.put(("done", text_runs, image_runs, stats))
             except Exception as exc:
                 self._scan_queue.put(("error", str(exc)))
@@ -2784,7 +2864,7 @@ class DefectCompareApp(tk.Tk):
                 font=("Arial", 10, "bold"),
             ).pack(anchor="w", padx=8, pady=8)
 
-        mode = "cache seul" if stats.get("from_cache_only") else ("suivi optimisé" if stats.get("follow_optimized") else "scan serveur")
+        mode = "cache seul" if stats.get("from_cache_only") else ("TXT uniquement" if stats.get("txt_only") else ("suivi optimisé" if stats.get("follow_optimized") else "scan serveur"))
         date_info = ""
         if self.date_filter_is_active():
             date_info = f" | filtre date appliqué au scan"
@@ -5421,6 +5501,7 @@ class DefectCompareApp(tk.Tk):
         ttk.Button(btns, text="Enregistrer la liste", command=self.save_follow_targets_from_ui).pack(side="left", padx=4)
         ttk.Button(btns, text="Scanner en mode suivi maintenant", command=self.scan).pack(side="left", padx=4)
         ttk.Checkbutton(btns, text="Mode suivi activé", variable=self.follow_mode_var).pack(side="left", padx=16)
+        ttk.Checkbutton(btns, text="TXT uniquement", variable=self.txt_only_var).pack(side="left", padx=8)
 
     def render_settings(self):
         self.clear_frame(self.settings_tab)
