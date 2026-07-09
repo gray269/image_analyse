@@ -965,8 +965,19 @@ def follow_txt_candidate_paths(text_dir: Path, target: str, progress_callback=No
     return candidates
 
 
+
 def follow_image_candidate_roots(image_dir: Path, product: str, progress_callback=None) -> list[Path]:
-    """Recherche ciblée des dossiers images du module, sans scan profond."""
+    """Recherche ultra-rapide du dossier images du module.
+
+    Principe voulu :
+    - dossier_images/NUMERO
+    - dossier_images/NUMERO*
+    puis fallback rapide seulement si besoin :
+    - dossier_images/QIA/NUMERO*
+
+    Important : on ne scanne plus les dossiers niveau 1 du répertoire image,
+    car sur serveur cela peut redevenir lent.
+    """
     product = str(product).strip()
     if not product:
         return []
@@ -974,33 +985,38 @@ def follow_image_candidate_roots(image_dir: Path, product: str, progress_callbac
     image_dir = Path(image_dir)
     roots = []
 
-    # Cas directs : dossier images\NUMERO* et dossier images\QIA\NUMERO*
-    roots.extend(fast_directory_glob(image_dir, f"{product}*", want_dirs=True))
-    roots.extend(fast_directory_glob(image_dir / "QIA", f"{product}*", want_dirs=True))
-
-    # Cas NomDuBanc\QIA\NUMERO* : scan seulement des dossiers niveau 1.
+    # 1) Cas le plus rapide : dossier exact.
+    direct = image_dir / product
     try:
-        with os.scandir(image_dir) as it:
-            for entry in it:
-                try:
-                    if not entry.is_dir(follow_symlinks=False):
-                        continue
-                    qia = Path(entry.path) / "QIA"
-                    if qia.exists():
-                        roots.extend(fast_directory_glob(qia, f"{product}*", want_dirs=True))
-                except OSError:
-                    continue
+        if direct.is_dir():
+            roots.append(direct)
     except OSError:
         pass
 
+    # 2) Même dossier uniquement : NUMERO*.
+    if not roots:
+        roots.extend(fast_directory_glob(image_dir, f"{product}*", want_dirs=True))
+
+    # 3) Fallback rapide si le dossier image sélectionné est au-dessus d'un dossier QIA.
+    # Pas de scan profond.
+    if not roots:
+        roots.extend(fast_directory_glob(image_dir / "QIA", f"{product}*", want_dirs=True))
+
     roots = unique_paths(roots)
+
     if progress_callback:
-        progress_callback(f"Mode suivi images {product} : {len(roots)} dossier(s) direct(s) trouvé(s).", len(roots))
+        progress_callback(
+            f"Mode suivi images {product} : {len(roots)} dossier(s) trouvé(s) directement dans le dossier images.",
+            len(roots),
+        )
     return roots
 
 
 def follow_image_candidate_files(image_dir: Path, product: str) -> list[Path]:
-    """Fallback non récursif : images directement dans le dossier image."""
+    """Fallback non récursif : images directement dans le dossier image.
+
+    On ne cherche que les fichiers du type NUMERO* dans le dossier image sélectionné.
+    """
     product = str(product).strip()
     if not product:
         return []
@@ -1009,6 +1025,7 @@ def follow_image_candidate_files(image_dir: Path, product: str) -> list[Path]:
     candidates = []
     for ext in IMAGE_EXTENSIONS:
         candidates.extend(fast_directory_glob(image_dir, f"{product}*{ext}", want_dirs=False))
+        candidates.extend(fast_directory_glob(image_dir / "QIA", f"{product}*{ext}", want_dirs=False))
     return unique_paths(candidates)
 
 def iter_images_under_roots_for_follow(roots: list[Path], cancel_event: threading.Event,
@@ -1033,7 +1050,7 @@ def iter_images_under_roots_for_follow(roots: list[Path], cancel_event: threadin
                             if Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
                                 visited += 1
                                 if progress_callback and visited % 100 == 0:
-                                    progress_callback(f"Mode suivi images : {visited} image(s) ciblée(s)…", visited)
+                                    progress_callback(f"Mode suivi images : {visited} image(s) lue(s) dans le dossier module…", visited)
                                 yield Path(entry.path)
                     except OSError:
                         continue
